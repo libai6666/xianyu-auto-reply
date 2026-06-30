@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.services.account_limit_service import AccountLimitService
@@ -420,7 +420,104 @@ class AccountService:
         self.session.add(account)
         await self.session.commit()
 
+    # 删除账号时需要一并清理的关联数据表
+    # key=按账号主键(bigint id)关联的表
+    _CLEANUP_TABLES_BY_PK = (
+        "xy_catalog_items",
+        "xy_account_login_logs",
+        "xy_keyword_rules",
+        "xy_risk_control_logs",
+    )
+    # key=按账号字符串(account_id varchar)关联的表
+    _CLEANUP_TABLES_BY_ACCOUNT_ID = (
+        "xy_auto_rate_configs",
+        "xy_auto_reply_message_logs",
+        "xy_confirm_receipt_messages",
+        "xy_cookie_refresh_schedules",
+        "xy_default_replies",
+        "xy_default_reply_records",
+        "xy_delivery_block_rules",
+        "xy_listing_monitor_logs",
+        "xy_message_filters",
+        "xy_orders",
+        "xy_personal_blacklist",
+        "xy_publish_addresses",
+        "xy_publish_logs",
+        "xy_scheduled_api_cookie_renew_log",
+        "xy_scheduled_close_notice_log",
+        "xy_scheduled_cookies_refresh_log",
+        "xy_scheduled_login_renew_log",
+        "xy_scheduled_polish_log",
+        "xy_scheduled_rate_log",
+        "xy_scheduled_red_flower_log",
+        "xy_scheduled_redelivery_log",
+        "xy_shared_scan_workers",
+    )
+    # key=按账号字符串(cookie_id varchar)关联的表
+    _CLEANUP_TABLES_BY_COOKIE_ID = (
+        "xy_ai_chat_messages",
+        "xy_feedbacks",
+        "xy_goofish_crawl_jobs",
+    )
+
+    async def _cleanup_account_related_data(self, account: XYAccount) -> None:
+        """删除账号前，清理所有按账号关联的数据，避免遗留孤儿脏数据。
+
+        商品(xy_catalog_items)、关键词、日志、定时任务记录、订单等都按账号关联，
+        如果只删 xy_accounts 这一行，这些数据会变成关联不到账号的孤儿行
+        （前端表现为"账号ID空白"且无法清理）。这里在删账号之前统一清掉。
+        """
+        pk = account.id
+        account_id_str = account.account_id
+
+        # 仅对当前库里真实存在的表执行删除，兼容不同部署的表差异
+        existing_rows = (
+            await self.session.execute(
+                text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE()"
+                )
+            )
+        ).scalars().all()
+        existing_tables = {name for name in existing_rows}
+
+        # 1) 先删卡券-商品关联：它按 item_id 关联到该账号名下的商品，
+        #    必须在删 xy_catalog_items 之前删，否则会留下孤儿关联
+        if {"xy_card_item_relations", "xy_catalog_items"} <= existing_tables:
+            await self.session.execute(
+                text(
+                    "DELETE FROM xy_card_item_relations WHERE item_id IN "
+                    "(SELECT item_id FROM xy_catalog_items WHERE account_id = :pk)"
+                ),
+                {"pk": pk},
+            )
+
+        # 2) 按主键 id 关联的表
+        for table in self._CLEANUP_TABLES_BY_PK:
+            if table in existing_tables:
+                await self.session.execute(
+                    text(f"DELETE FROM {table} WHERE account_id = :pk"),
+                    {"pk": pk},
+                )
+
+        # 3) 按 account_id 字符串关联的表
+        for table in self._CLEANUP_TABLES_BY_ACCOUNT_ID:
+            if table in existing_tables:
+                await self.session.execute(
+                    text(f"DELETE FROM {table} WHERE account_id = :aid"),
+                    {"aid": account_id_str},
+                )
+
+        # 4) 按 cookie_id 字符串关联的表
+        for table in self._CLEANUP_TABLES_BY_COOKIE_ID:
+            if table in existing_tables:
+                await self.session.execute(
+                    text(f"DELETE FROM {table} WHERE cookie_id = :aid"),
+                    {"aid": account_id_str},
+                )
+
     async def delete_account(self, account: XYAccount) -> None:
+        await self._cleanup_account_related_data(account)
         await self.session.delete(account)
         await self.session.commit()
 
