@@ -114,6 +114,7 @@ async def refresh_cookies(request: CookiesRefreshRequest) -> dict[str, Any]:
                 },
             }
 
+        logger.info(f"【内部API】账号 {account.account_id} COOKIES续期接口执行成功: {browser_result.message}")
         return {
             "success": True,
             "code": 200,

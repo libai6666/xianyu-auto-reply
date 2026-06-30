@@ -135,7 +135,8 @@ class NotificationManager:
             logger.error(f"📱 处理消息通知失败: {self._safe_str(e)}")
 
     async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str,
-                                                  item_id: str, error_message: str, chat_id: str = None):
+                                                  item_id: str, error_message: str, chat_id: str = None,
+                                                  order_id: str = None):
         """发送自动发货失败通知"""
         try:
             from common.db.compat import db_manager
@@ -175,6 +176,7 @@ class NotificationManager:
                                  f"闲鱼账号: {account_desc}\n" \
                                  f"买家: {send_user_name} (ID: {send_user_id})\n" \
                                  f"商品ID: {item_id}\n" \
+                                 f"订单ID: {order_id or '未生成'}\n" \
                                  f"聊天ID: {chat_id or '未知'}\n" \
                                  f"结果: {error_message}\n" \
                                  f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \

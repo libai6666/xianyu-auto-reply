@@ -743,6 +743,15 @@ async def delete_item(
     # 管理员可以操作所有账号，普通用户只能操作自己的账号
     owner_id, _ = resolve_owner_scope(current_user)
 
+    # 兼容前端旧版本：cookie_id 为 null/undefined 字符串时按孤儿商品删除
+    if cookie_id in ("null", "undefined", ""):
+        result = await item_service.delete_item_smart(owner_id, item_id, None)
+        if result == "ok":
+            return ApiResponse(success=True, message="商品已删除")
+        if result == "account_required":
+            return ApiResponse(success=False, message="该商品所属账号仍存在，请指定账号后再删除")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="商品不存在")
+
     account = await account_service.get_account_for_user(owner_id, cookie_id)
     if not account:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")

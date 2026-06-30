@@ -1033,6 +1033,36 @@ class XianyuAsync:
     def ws(self):
         """获取当前WebSocket连接"""
         return self.connection_manager.ws if self.connection_manager else None
+
+    def is_ws_connected(self) -> bool:
+        """当前WebSocket是否处于已连接(CONNECTED)且连接对象可用状态"""
+        cm = self.connection_manager
+        if cm is None:
+            return False
+        return cm.connection_state == ConnectionState.CONNECTED and cm.ws is not None
+
+    async def wait_until_connected(self, timeout: float = 30.0, poll_interval: float = 0.5) -> bool:
+        """等待WebSocket连接恢复到 CONNECTED 状态
+
+        发送消息遇到连接断开时，调用本方法等待重连完成后再重试，
+        避免在断线/重连空档内按固定间隔盲目重试导致全部失败。
+        连接就绪后立即返回（轮询粒度 poll_interval），不会白白等满 timeout。
+
+        Args:
+            timeout: 最长等待秒数
+            poll_interval: 轮询间隔秒数
+
+        Returns:
+            True 表示在超时前连接已就绪，False 表示超时仍未就绪
+        """
+        if self.is_ws_connected():
+            return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+            if self.is_ws_connected():
+                return True
+        return self.is_ws_connected()
     
     def is_lock_held(self, lock_key: str) -> bool:
         """检查锁是否被持有"""

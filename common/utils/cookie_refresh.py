@@ -128,7 +128,10 @@ def build_playwright_cookie_payloads_from_snapshot(
             payload["secure"] = secure
         same_site = cookie.get("sameSite")
         if same_site:
-            payload["sameSite"] = str(same_site)
+            _VALID_SAME_SITE = {"Strict", "Lax", "None"}
+            same_site_str = str(same_site).capitalize()
+            if same_site_str in _VALID_SAME_SITE:
+                payload["sameSite"] = same_site_str
         payloads.append(payload)
     return payloads
 

@@ -181,15 +181,74 @@ class AutoDeliveryHandler:
     
     async def send_msg(self, websocket, chat_id, send_user_id, content):
         return await self.parent.send_msg(websocket, chat_id, send_user_id, content)
+
+    @staticmethod
+    def _is_connection_closed_error(error_msg: str) -> bool:
+        """判断发送失败是否为 WebSocket 连接断开类错误
+
+        这类错误（如重连空档内 .send() 抛出的 ConnectionClosedError）单纯
+        按固定间隔重试无意义——连接没恢复前每次都会失败。识别后由调用方
+        改为"等待重连完成再重试"。
+
+        Args:
+            error_msg: 发送失败的错误信息
+
+        Returns:
+            True 表示是连接断开类错误
+        """
+        if not error_msg:
+            return False
+        msg = str(error_msg).lower()
+        keywords = [
+            "no close frame received or sent",
+            "connectionclosed",
+            "connection closed",
+            "connection is closed",
+            "is closed",
+            "code = 1006",
+            "连接已断开",
+            "连接已关闭",
+            "websocket连接已关闭",
+        ]
+        return any(k in msg for k in keywords)
+
+    async def _wait_reconnect_before_retry(self, error_msg: str, retry_delay: int,
+                                           reconnect_wait: float) -> None:
+        """重试前的等待：连接断开类错误等待重连完成，其它错误按固定间隔退避
+
+        Args:
+            error_msg: 本次发送失败的错误信息
+            retry_delay: 非连接类错误时的固定退避秒数
+            reconnect_wait: 连接类错误时等待重连的最长秒数
+        """
+        if self._is_connection_closed_error(error_msg):
+            waiter = getattr(self.parent, "wait_until_connected", None)
+            if callable(waiter):
+                logger.info(
+                    f"【{self.cookie_id}】检测到连接断开，等待重连完成后再重试（最多{reconnect_wait:.0f}秒）..."
+                )
+                reconnected = await waiter(timeout=reconnect_wait)
+                if reconnected:
+                    logger.info(f"【{self.cookie_id}】WebSocket已重连，立即重试发送")
+                else:
+                    logger.warning(
+                        f"【{self.cookie_id}】等待重连超时（{reconnect_wait:.0f}秒），仍尝试重试发送"
+                    )
+                return
+        await asyncio.sleep(retry_delay)
     
     async def send_image_msg(self, websocket, chat_id, send_user_id, image_url, card_id=None, keyword=None, default_reply_item_id=None, image_index=None):
         return await self.parent.send_image_msg(websocket, chat_id, send_user_id, image_url, card_id=card_id, keyword=keyword, default_reply_item_id=default_reply_item_id, image_index=image_index)
     
     async def _send_msg_with_retry(self, websocket, chat_id: str, send_user_id: str,
-                                    content: str, max_retries: int = 5, retry_delay: int = 2) -> dict:
+                                    content: str, max_retries: int = 5, retry_delay: int = 2,
+                                    reconnect_wait: float = 30.0) -> dict:
         """发送文本消息（带重试机制）
         
-        失败后等待指定秒数再重试，重试时尝试获取最新的WebSocket连接（可能已重连）。
+        失败后重试，重试时尝试获取最新的WebSocket连接（可能已重连）。
+        若失败原因是连接断开类错误，则等待重连完成后再重试，而不是按固定间隔
+        盲目重试——否则一次断线重连耗时（约 20 秒）会把全部重试窗口耗光，导致
+        发货消息始终发不出去。
         
         Args:
             websocket: WebSocket连接
@@ -197,7 +256,8 @@ class AutoDeliveryHandler:
             send_user_id: 接收者用户ID
             content: 消息内容
             max_retries: 最大重试次数
-            retry_delay: 重试间隔（秒）
+            retry_delay: 非连接类错误的重试间隔（秒）
+            reconnect_wait: 连接断开类错误时等待重连的最长秒数
             
         Returns:
             发送结果字典
@@ -214,8 +274,8 @@ class AutoDeliveryHandler:
             if attempt >= max_retries:
                 break
             error_msg = result.get("error_message", "未知错误") if isinstance(result, dict) else "返回值异常"
-            logger.warning(f"【{self.cookie_id}】发送消息失败(第{attempt+1}次): {error_msg}，{retry_delay}秒后重试...")
-            await asyncio.sleep(retry_delay)
+            logger.warning(f"【{self.cookie_id}】发送消息失败(第{attempt+1}次): {error_msg}，准备重试...")
+            await self._wait_reconnect_before_retry(error_msg, retry_delay, reconnect_wait)
             # 重试时尝试获取最新的WebSocket连接（连接可能已重建）
             try:
                 latest_ws = self.ws
@@ -228,8 +288,10 @@ class AutoDeliveryHandler:
     
     async def _send_image_msg_with_retry(self, websocket, chat_id: str, send_user_id: str,
                                           image_url: str, max_retries: int = 5, retry_delay: int = 2,
-                                          **kwargs) -> dict:
+                                          reconnect_wait: float = 30.0, **kwargs) -> dict:
         """发送图片消息（带重试机制）
+        
+        与 _send_msg_with_retry 一致：连接断开类错误等待重连完成后再重试。
         
         Args:
             websocket: WebSocket连接
@@ -237,7 +299,8 @@ class AutoDeliveryHandler:
             send_user_id: 接收者用户ID
             image_url: 图片URL
             max_retries: 最大重试次数
-            retry_delay: 重试间隔（秒）
+            retry_delay: 非连接类错误的重试间隔（秒）
+            reconnect_wait: 连接断开类错误时等待重连的最长秒数
             **kwargs: 传递给 send_image_msg 的其他参数
             
         Returns:
@@ -254,8 +317,8 @@ class AutoDeliveryHandler:
             if attempt >= max_retries:
                 break
             error_msg = result.get("error_message", "未知错误") if isinstance(result, dict) else "返回值异常"
-            logger.warning(f"【{self.cookie_id}】发送图片失败(第{attempt+1}次): {error_msg}，{retry_delay}秒后重试...")
-            await asyncio.sleep(retry_delay)
+            logger.warning(f"【{self.cookie_id}】发送图片失败(第{attempt+1}次): {error_msg}，准备重试...")
+            await self._wait_reconnect_before_retry(error_msg, retry_delay, reconnect_wait)
             try:
                 latest_ws = self.ws
                 if latest_ws is not None and latest_ws != current_ws:
@@ -347,12 +410,12 @@ class AutoDeliveryHandler:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】更新订单发货失败原因失败: {self._safe_str(e)}")
 
-    async def send_delivery_failure_notification(self, send_user_name, send_user_id, item_id, error_message, chat_id):
+    async def send_delivery_failure_notification(self, send_user_name, send_user_id, item_id, error_message, chat_id, order_id=None):
         """发送发货通知 - 直接调用NotificationManager"""
         try:
             from app.services.xianyu.notification_manager import NotificationManager
             notification_manager = NotificationManager(self.cookie_id)
-            return await notification_manager.send_delivery_failure_notification(send_user_name, send_user_id, item_id, error_message, chat_id)
+            return await notification_manager.send_delivery_failure_notification(send_user_name, send_user_id, item_id, error_message, chat_id, order_id)
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送发货通知失败: {self._safe_str(e)}")
     
@@ -878,16 +941,23 @@ class AutoDeliveryHandler:
             # 检查订单金额，金额为0禁止发货
             try:
                 from common.db.compat import db_manager
+                from decimal import Decimal
                 order_check = db_manager.get_order_by_id(order_id)
-                if order_check:
-                    order_amount = order_check.get('amount')
-                    if order_amount is not None:
-                        from decimal import Decimal
-                        if Decimal(str(order_amount)) <= 0:
-                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 订单 {order_id} 金额为 {order_amount}，禁止自动发货')
-                            # 记录失败原因（对外展示统一提示为账号掉线，便于运营快速定位真实原因）
-                            await self._update_delivery_fail_reason(order_id, "账号已掉线，请重新登录")
-                            return
+                order_amount = order_check.get('amount') if order_check else None
+                # 金额为 0 或 None 时，可能是订单详情还未异步获取完成（买家拍下后立即付款的 race condition），
+                # 主动同步拉取一次订单详情再判断，避免误判为异常订单
+                if order_amount is None or Decimal(str(order_amount)) <= 0:
+                    logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 当前金额为 {order_amount}，主动同步获取订单详情后再判断')
+                    try:
+                        await self.fetch_order_detail_info(order_id, item_id, send_user_id)
+                        order_check = db_manager.get_order_by_id(order_id)
+                        order_amount = order_check.get('amount') if order_check else None
+                    except Exception as fetch_e:
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】主动获取订单详情失败: {self._safe_str(fetch_e)}')
+                    if order_amount is None or Decimal(str(order_amount)) <= 0:
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 订单 {order_id} 金额为 {order_amount}，禁止自动发货')
+                        await self._update_delivery_fail_reason(order_id, f"订单金额异常（{order_amount}），无法自动发货")
+                        return
             except Exception as e:
                 logger.warning(f'[{msg_time}] 【{self.cookie_id}】检查订单金额异常: {self._safe_str(e)}')
 
@@ -1275,7 +1345,7 @@ class AutoDeliveryHandler:
                                     await self.send_delivery_failure_notification(
                                         send_user_name, send_user_id, item_id,
                                         send_before_confirm_fail_msg,
-                                        chat_id,
+                                        chat_id, order_id,
                                     )
                             else:
                                 send_before_confirm_fail_msg = "⚠️ 卡券已发送成功，但自动确认发货已关闭，请手动确认发货"
@@ -1286,14 +1356,14 @@ class AutoDeliveryHandler:
                             await self.send_delivery_failure_notification(
                                 send_user_name, send_user_id, item_id,
                                 send_before_confirm_fail_msg,
-                                chat_id,
+                                chat_id, order_id,
                             )
 
                         # 如果有消息发送失败，额外发通知告知（不影响订单状态）
                         if any_send_failed:
                             fail_notify_msg = "部分发货消息发送失败（WebSocket连接断开），请检查买家是否收到完整内容"
                             logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} {fail_notify_msg}')
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_notify_msg, chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_notify_msg, chat_id, order_id)
 
                         # 发送成功通知（仅 IM 通知，fail_reason 写库延后到 update_order_delivery_info 之后，
                         # 否则会被 update_order_delivery_info 内部的 delivery_fail_reason=None 清空）
@@ -1304,7 +1374,7 @@ class AutoDeliveryHandler:
                                 send_user_name, send_user_id, item_id,
                                 f"⚠️ 对接卡券暂不支持多数量发货：订单数量 {quantity_to_send} 张，"
                                 f"已自动发送 {len(delivery_contents)} 张，剩余 {remaining} 张请手动补发或改用自有卡券",
-                                chat_id,
+                                chat_id, order_id,
                             )
                         elif quantity_degraded_for_fixed_content:
                             # text/image 固定内容卡券退化场景：商家应改用 data/api 类型卡券支持多数量
@@ -1314,12 +1384,12 @@ class AutoDeliveryHandler:
                                 f"⚠️ 固定内容卡券（{self._last_delivery_card_type} 类型）不支持多数量发货："
                                 f"订单数量 {quantity_to_send} 张，仅发送 1 张固定内容（剩余 {remaining} 张未发）。"
                                 f"如需多数量发送不同卡密，请改用 data 或 api 类型卡券",
-                                chat_id,
+                                chat_id, order_id,
                             )
                         elif len(delivery_contents) > 1:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id, order_id)
                         else:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id, order_id)
                         
                         # 更新订单状态和发货信息（不受消息发送结果影响）
                         # card_only 场景：订单已被关闭，仅记录补发卡券内容，不动 status / fail_reason
@@ -1430,7 +1500,7 @@ class AutoDeliveryHandler:
                             # 更新订单发货失败原因
                             await self._update_delivery_fail_reason(order_id, fail_msg)
                             # 发送自动发货失败通知
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id, order_id)
 
                 except Exception as e:
                     fail_msg = f"自动发货处理异常: {str(e)}"
@@ -1445,7 +1515,7 @@ class AutoDeliveryHandler:
                         # 更新订单发货失败原因
                         await self._update_delivery_fail_reason(order_id, fail_msg)
                         # 发送自动发货异常通知
-                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id)
+                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id, order_id)
 
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】自动发货处理完成: {lock_key}')
             
