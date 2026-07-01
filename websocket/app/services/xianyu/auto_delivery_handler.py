@@ -410,12 +410,12 @@ class AutoDeliveryHandler:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】更新订单发货失败原因失败: {self._safe_str(e)}")
 
-    async def send_delivery_failure_notification(self, send_user_name, send_user_id, item_id, error_message, chat_id, order_id=None):
+    async def send_delivery_failure_notification(self, send_user_name, send_user_id, item_id, error_message, chat_id):
         """发送发货通知 - 直接调用NotificationManager"""
         try:
             from app.services.xianyu.notification_manager import NotificationManager
             notification_manager = NotificationManager(self.cookie_id)
-            return await notification_manager.send_delivery_failure_notification(send_user_name, send_user_id, item_id, error_message, chat_id, order_id)
+            return await notification_manager.send_delivery_failure_notification(send_user_name, send_user_id, item_id, error_message, chat_id)
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送发货通知失败: {self._safe_str(e)}")
     
@@ -944,20 +944,21 @@ class AutoDeliveryHandler:
                 from decimal import Decimal
                 order_check = db_manager.get_order_by_id(order_id)
                 order_amount = order_check.get('amount') if order_check else None
-                # 金额为 0 或 None 时，可能是订单详情还未异步获取完成（买家拍下后立即付款的 race condition），
-                # 主动同步拉取一次订单详情再判断，避免误判为异常订单
+                # 金额为空或<=0时，可能是异步订单详情尚未写库（付款消息早于详情回写），
+                # 主动同步拉一次订单详情并回写金额后再判断，避免把正常订单误判为金额0而误拦
                 if order_amount is None or Decimal(str(order_amount)) <= 0:
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 当前金额为 {order_amount}，主动同步获取订单详情后再判断')
                     try:
-                        await self.fetch_order_detail_info(order_id, item_id, send_user_id)
-                        order_check = db_manager.get_order_by_id(order_id)
-                        order_amount = order_check.get('amount') if order_check else None
-                    except Exception as fetch_e:
-                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】主动获取订单详情失败: {self._safe_str(fetch_e)}')
-                    if order_amount is None or Decimal(str(order_amount)) <= 0:
-                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 订单 {order_id} 金额为 {order_amount}，禁止自动发货')
-                        await self._update_delivery_fail_reason(order_id, f"订单金额异常（{order_amount}），无法自动发货")
-                        return
+                        await self.fetch_order_detail_info(order_id, buyer_id=send_user_id)
+                    except Exception as fe:
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 同步获取订单详情失败: {self._safe_str(fe)}')
+                    order_check = db_manager.get_order_by_id(order_id)
+                    order_amount = order_check.get('amount') if order_check else None
+                if order_amount is not None and Decimal(str(order_amount)) <= 0:
+                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 订单 {order_id} 金额为 {order_amount}，禁止自动发货')
+                    # 记录失败原因（对外展示统一提示为账号掉线，便于运营快速定位真实原因）
+                    await self._update_delivery_fail_reason(order_id, "账号已掉线，请重新登录")
+                    return
             except Exception as e:
                 logger.warning(f'[{msg_time}] 【{self.cookie_id}】检查订单金额异常: {self._safe_str(e)}')
 
@@ -1105,6 +1106,9 @@ class AutoDeliveryHandler:
 
                     # 多次调用自动发货方法，每次获取不同的内容
                     delivery_contents = []
+                    # 多数量合并用：收集每张卡密的"原始内容"（未套说明模板），
+                    # 供文本类（data/api）合并成一条消息、说明只渲染一次
+                    raw_values_for_merge = []
                     success_count = 0
                     order_already_shipped = False  # 标记订单是否已发货
                     # 对接卡券退化标记：多数量循环里若第 1 张匹配到对接卡券，强制 break 退化为 1 张
@@ -1117,6 +1121,7 @@ class AutoDeliveryHandler:
                     # 在循环开始前清空上次的卡券来源/类型记录，避免跨订单残留
                     self._last_delivery_card_source = None
                     self._last_delivery_card_type = None
+                    self._last_delivery_raw_content = None
 
                     for i in range(quantity_to_send):
                         try:
@@ -1128,6 +1133,9 @@ class AutoDeliveryHandler:
                             )
                             if delivery_content:
                                 delivery_contents.append(delivery_content)
+                                # 收集本张原始内容（未套说明模板），用于多数量合并发送
+                                if getattr(self, '_last_delivery_raw_content', None) is not None:
+                                    raw_values_for_merge.append(self._last_delivery_raw_content)
                                 success_count += 1
                                 if quantity_to_send > 1:
                                     logger.info(f"第 {i+1}/{quantity_to_send} 个卡券内容获取成功")
@@ -1188,6 +1196,29 @@ class AutoDeliveryHandler:
                         # 启动延迟释放锁的异步任务（10分钟后释放）
                         delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
                         self._lock_hold_info[lock_key]['task'] = delay_task
+
+                        # 多数量合并：文本类卡券（data/api）把 N 份卡密合并成"一条消息"，
+                        # 说明模板只渲染一次（账号行按行堆叠、说明只出现一次）。
+                        # 图片类（含图片标记）无法并入一条文本消息，保持逐张发送。
+                        if (len(delivery_contents) > 1
+                                and not quantity_degraded_for_dock
+                                and not quantity_degraded_for_fixed_content
+                                and self._last_delivery_card_type in ('data', 'api')
+                                and len(raw_values_for_merge) == len(delivery_contents)
+                                and all(
+                                    not dc.startswith(("__DELIVERY_WITH_IMAGES__", "__MULTI_IMAGE_SEND__", "__IMAGE_SEND__"))
+                                    for dc in delivery_contents
+                                )):
+                            merged_raw = "\n".join(raw_values_for_merge)
+                            merged_rendered = process_delivery_content_with_description(
+                                merged_raw,
+                                getattr(self, '_last_delivery_card_description', '') or '',
+                                getattr(self, '_last_delivery_order_context', None) or {},
+                            )
+                            logger.info(
+                                f"【{self.cookie_id}】多数量发货合并为一条消息：共 {len(raw_values_for_merge)} 张卡密，说明只渲染一次"
+                            )
+                            delivery_contents = [merged_rendered]
 
                         # 发送所有获取到的发货内容，跟踪发送结果
                         any_send_failed = False
@@ -1345,7 +1376,7 @@ class AutoDeliveryHandler:
                                     await self.send_delivery_failure_notification(
                                         send_user_name, send_user_id, item_id,
                                         send_before_confirm_fail_msg,
-                                        chat_id, order_id,
+                                        chat_id,
                                     )
                             else:
                                 send_before_confirm_fail_msg = "⚠️ 卡券已发送成功，但自动确认发货已关闭，请手动确认发货"
@@ -1356,14 +1387,14 @@ class AutoDeliveryHandler:
                             await self.send_delivery_failure_notification(
                                 send_user_name, send_user_id, item_id,
                                 send_before_confirm_fail_msg,
-                                chat_id, order_id,
+                                chat_id,
                             )
 
                         # 如果有消息发送失败，额外发通知告知（不影响订单状态）
                         if any_send_failed:
                             fail_notify_msg = "部分发货消息发送失败（WebSocket连接断开），请检查买家是否收到完整内容"
                             logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} {fail_notify_msg}')
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_notify_msg, chat_id, order_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_notify_msg, chat_id)
 
                         # 发送成功通知（仅 IM 通知，fail_reason 写库延后到 update_order_delivery_info 之后，
                         # 否则会被 update_order_delivery_info 内部的 delivery_fail_reason=None 清空）
@@ -1374,7 +1405,7 @@ class AutoDeliveryHandler:
                                 send_user_name, send_user_id, item_id,
                                 f"⚠️ 对接卡券暂不支持多数量发货：订单数量 {quantity_to_send} 张，"
                                 f"已自动发送 {len(delivery_contents)} 张，剩余 {remaining} 张请手动补发或改用自有卡券",
-                                chat_id, order_id,
+                                chat_id,
                             )
                         elif quantity_degraded_for_fixed_content:
                             # text/image 固定内容卡券退化场景：商家应改用 data/api 类型卡券支持多数量
@@ -1384,12 +1415,12 @@ class AutoDeliveryHandler:
                                 f"⚠️ 固定内容卡券（{self._last_delivery_card_type} 类型）不支持多数量发货："
                                 f"订单数量 {quantity_to_send} 张，仅发送 1 张固定内容（剩余 {remaining} 张未发）。"
                                 f"如需多数量发送不同卡密，请改用 data 或 api 类型卡券",
-                                chat_id, order_id,
+                                chat_id,
                             )
                         elif len(delivery_contents) > 1:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id, order_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
                         else:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id, order_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
                         
                         # 更新订单状态和发货信息（不受消息发送结果影响）
                         # card_only 场景：订单已被关闭，仅记录补发卡券内容，不动 status / fail_reason
@@ -1500,7 +1531,7 @@ class AutoDeliveryHandler:
                             # 更新订单发货失败原因
                             await self._update_delivery_fail_reason(order_id, fail_msg)
                             # 发送自动发货失败通知
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id, order_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id)
 
                 except Exception as e:
                     fail_msg = f"自动发货处理异常: {str(e)}"
@@ -1515,7 +1546,7 @@ class AutoDeliveryHandler:
                         # 更新订单发货失败原因
                         await self._update_delivery_fail_reason(order_id, fail_msg)
                         # 发送自动发货异常通知
-                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id, order_id)
+                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, fail_msg, chat_id)
 
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】自动发货处理完成: {lock_key}')
             
@@ -1883,37 +1914,18 @@ class AutoDeliveryHandler:
                         if confirm_result.get('success'):
                             self.confirmed_orders[order_id] = current_time
                             
-                            # 检查是否是"已发货成功"的响应
+                            # 平台返回"已发货成功 / ORDER_ALREADY_DELIVERY"：
+                            # 只代表闲鱼平台层面已确认发货，并不代表卡券内容已发给买家。
+                            # 进入本分支前，外层已用"数据库 status==shipped" + 冷却时间 + Redis分布式锁
+                            # 做过重复发货拦截；能走到这里说明本系统尚未真正发出卡券——
+                            # 常见于确认发货首次请求其实已成功、但响应因连接断开(Server disconnected)丢失，
+                            # 随后重试拿到 ORDER_ALREADY_DELIVERY。此时若直接 return 会导致"显示已发货、
+                            # 但买家从未收到卡券"。因此这里不再跳过，视为确认发货已完成，继续向下发送卡券内容。
                             success_msg = confirm_result.get('message', '')
                             if 'ORDER_ALREADY_DELIVERY' in success_msg or '已发货成功' in success_msg:
-                                logger.info(f"【{self.cookie_id}】订单 {order_id} 已发货过，只更新数据库状态，不再发送卡券")
-                                
-                                # 更新订单状态为已发货
-                                try:
-                                    from common.services.order_service import OrderService
-                                    from common.db.session import async_session_maker
-                                    async with async_session_maker() as db_session:
-                                        order_service = OrderService(db_session)
-                                        # 确认发货成功但不发送卡券，记录发货方式为"自动发货"，内容为空
-                                        await order_service.update_order_delivery_info(
-                                            order_no=order_id,
-                                            status="shipped",
-                                            delivery_method="auto",
-                                            delivery_content="订单已确认发货（闲鱼平台已发货）",
-                                            buyer_fish_nick=local_buyer_fish_nick,
-                                        )
-                                    logger.info(f"【{self.cookie_id}】订单 {order_id} 状态已更新为已发货")
-                                except Exception as e:
-                                    logger.error(f"【{self.cookie_id}】更新订单状态失败: {self._safe_str(e)}")
-                                
-                                # 标记已发货，防止重复处理
-                                self.mark_delivery_sent(order_id)
-                                
-                                # 直接返回None，不再发送卡券内容
-                                self._last_delivery_fail_reason = f"订单 {order_id} 已发货过，不再发送卡券"
-                                return None
-                            
-                            logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
+                                logger.info(f"【{self.cookie_id}】订单 {order_id} 闲鱼平台已确认发货（可能为确认发货重试），继续发送卡券内容")
+                            else:
+                                logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
                         else:
                             confirm_error = confirm_result.get('error', '未知错误')
                             logger.warning(f"⚠️ 自动确认发货失败: {confirm_error}")
@@ -1995,6 +2007,14 @@ class AutoDeliveryHandler:
                         self._last_delivery_fail_reason = f"批量卡券数据已用完或获取失败: 卡券ID={rule['card_id']}, 名称={rule['card_name']}"
                         logger.warning(self._last_delivery_fail_reason)
                         return None
+                    # 记录已售卡密到库存明细表（best-effort，失败不影响发货）
+                    try:
+                        db_manager.record_card_sold(
+                            rule['card_id'], text_content,
+                            order_id=order_id, account_id=self.cookie_id, buyer_id=send_user_id,
+                        )
+                    except Exception:
+                        pass
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：文字内容为空，只发送图片
@@ -2037,6 +2057,11 @@ class AutoDeliveryHandler:
                     'buyer_id': send_user_id or '',
                     'seller_name': seller_name,
                 }
+                # 多数量合并所需上下文：默认本次无可合并的纯文本原始内容（图片类型保持 None，不参与合并），
+                # 仅在"纯文本"分支把原始 text_content 记录下来
+                self._last_delivery_raw_content = None
+                self._last_delivery_card_description = card_description
+                self._last_delivery_order_context = order_context
                 
                 # 构建发货内容
                 # 格式: __DELIVERY_WITH_IMAGES__卡券ID|图片数量|图片URL1|图片URL2|...|文字内容
@@ -2067,6 +2092,7 @@ class AutoDeliveryHandler:
                     logger.info(f"准备发送图片和文字内容 (卡券ID: {rule['card_id']})")
                 elif text_content:
                     # 没有图片，只有文字
+                    self._last_delivery_raw_content = text_content
                     delivery_content = process_delivery_content_with_description(text_content, card_description, order_context)
                 elif card_description:
                     # 没有图片也没有text_content，但有备注（图片类型卡券只填了备注）

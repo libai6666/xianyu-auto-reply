@@ -476,13 +476,17 @@ class RedeliveryTask:
             if need_api_fetch:
                 logger.info(f"[定时补发货] 订单 {order_no} {', '.join(fetch_reasons)}，尝试从API重新获取...")
                 try:
-                    from common.services.order_service import OrderStatusChecker
+                    from common.services.order_service import OrderStatusChecker, OrderService
                     from decimal import Decimal
                     checker = OrderStatusChecker(cookie_string, account_id=order.account_id if hasattr(order, 'account_id') else None)
                     raw_detail = await checker._fetch_raw_order_detail(order_no)
                     if raw_detail:
-                        # 使用完整的解析方法提取金额和规格
-                        parsed = checker._parse_order_detail_response(order_no, raw_detail)
+                        # 使用完整的解析方法提取金额、规格和数量
+                        # _parse_order_detail_response 定义在 OrderService 上（不是 OrderStatusChecker），
+                        # 且内部日志会用到 self.cookie_id，实例化后需补上，否则会抛 AttributeError 导致规格/数量刷新失败。
+                        _order_service = OrderService(session)
+                        _order_service.cookie_id = order.account_id if getattr(order, 'account_id', None) else account_id
+                        parsed = _order_service._parse_order_detail_response(order_no, raw_detail)
                         if parsed:
                             updated_fields = []
                             # 更新金额
@@ -497,6 +501,16 @@ class RedeliveryTask:
                                 order.spec_name = api_spec_name
                                 order.spec_value = api_spec_value
                                 updated_fields.append(f"规格={api_spec_name}:{api_spec_value}")
+                            # 更新数量：多数量发货依赖 quantity，若不从API刷新，
+                            # 会沿用 DB 默认值 1，导致买家下 N 件却只发 1 张卡券。
+                            api_quantity = parsed.get('quantity', '')
+                            try:
+                                api_qty_int = int(api_quantity) if api_quantity else 0
+                            except (ValueError, TypeError):
+                                api_qty_int = 0
+                            if api_qty_int > 0 and api_qty_int != (order.quantity or 0):
+                                order.quantity = api_qty_int
+                                updated_fields.append(f"数量={api_qty_int}")
                             
                             if updated_fields:
                                 await session.commit()

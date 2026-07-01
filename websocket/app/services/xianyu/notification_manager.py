@@ -61,6 +61,15 @@ class NotificationManager:
         try:
             from common.db.compat import db_manager
 
+            # 【方案A】聊天消息通知开关：关闭时不发买家聊天通知。
+            # 订单/发货通知走 send_delivery_failure_notification，不受此开关影响。
+            try:
+                if not db_manager.is_chat_notify_enabled(self.cookie_id):
+                    logger.info(f"📱 账号 {self.cookie_id} 已关闭聊天消息通知，跳过聊天通知")
+                    return
+            except Exception as e:
+                logger.warning(f"📱 读取聊天通知开关失败，按默认发送: {self._safe_str(e)}")
+
             # 过滤系统默认消息
             system_messages = ['发来一条消息', '发来一条新消息']
             if send_message in system_messages:

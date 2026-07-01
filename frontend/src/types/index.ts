@@ -192,6 +192,8 @@ export interface MessageNotification {
   channel_id: number
   channel_name?: string
   enabled: boolean
+  // 是否发送"聊天消息"通知（关闭后仅发订单/发货类通知）
+  chat_notify_enabled?: boolean
 }
 
 // 系统设置相关类型

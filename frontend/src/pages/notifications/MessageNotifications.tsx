@@ -82,6 +82,17 @@ export function MessageNotifications() {
     }
   }
 
+  const handleToggleChatNotify = async (notification: MessageNotification) => {
+    const next = !(notification.chat_notify_enabled ?? true)
+    try {
+      await setMessageNotification(notification.cookie_id, notification.channel_id, notification.enabled, next)
+      addToast({ type: 'success', message: next ? '聊天消息通知已开启' : '聊天消息通知已关闭（仅发订单/发货通知）' })
+      loadNotifications()
+    } catch {
+      addToast({ type: 'error', message: '操作失败' })
+    }
+  }
+
   const handleDelete = async (notification: MessageNotification) => {
     setDeleting(true)
     try {
@@ -175,13 +186,14 @@ export function MessageNotifications() {
                 <th>账号ID</th>
                 <th>通知渠道</th>
                 <th>状态</th>
+                <th>聊天消息通知</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody>
               {notifications.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="text-center py-8 text-gray-500">
+                  <td colSpan={5} className="text-center py-8 text-gray-500">
                     <div className="flex flex-col items-center gap-2">
                       <Mail className="w-12 h-12 text-gray-300" />
                       <p>暂无消息通知配置</p>
@@ -206,6 +218,27 @@ export function MessageNotifications() {
                       ) : (
                         <span className="badge-danger">禁用</span>
                       )}
+                    </td>
+                    <td>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleChatNotify(notification)}
+                          title={(notification.chat_notify_enabled ?? true) ? '点击关闭：买家聊天消息不再通知（订单/发货通知不受影响）' : '点击开启：买家聊天消息也发送通知'}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            (notification.chat_notify_enabled ?? true) ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              (notification.chat_notify_enabled ?? true) ? 'translate-x-6' : 'translate-x-1'
+                            }`}
+                          />
+                        </button>
+                        <span className="text-xs text-gray-500">
+                          {(notification.chat_notify_enabled ?? true) ? '开' : '关（仅订单/发货）'}
+                        </span>
+                      </div>
                     </td>
                     <td>
                       <div className="flex gap-1">

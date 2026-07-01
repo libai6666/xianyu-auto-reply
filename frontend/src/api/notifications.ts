@@ -105,6 +105,7 @@ interface BackendNotification {
   id: number
   channel_id: number
   enabled: boolean
+  chat_notify_enabled?: boolean
   channel_name?: string
   channel_type?: string
   channel_config?: string
@@ -124,6 +125,7 @@ export const getMessageNotifications = async (): Promise<{ success: boolean; dat
           channel_id: item.channel_id,
           channel_name: item.channel_name,
           enabled: item.enabled,
+          chat_notify_enabled: item.chat_notify_enabled ?? true,
         })
       }
     }
@@ -132,8 +134,18 @@ export const getMessageNotifications = async (): Promise<{ success: boolean; dat
 }
 
 // 设置消息通知 - 后端接口需要 cookie_id 作为路径参数
-export const setMessageNotification = (cookieId: string, channelId: number, enabled: boolean): Promise<ApiResponse> => {
-  return post(`${MESSAGE_PREFIX}/${cookieId}`, { channel_id: channelId, enabled })
+// chatNotifyEnabled 传 undefined 时不改动"聊天消息通知"开关（兼容旧调用）
+export const setMessageNotification = (
+  cookieId: string,
+  channelId: number,
+  enabled: boolean,
+  chatNotifyEnabled?: boolean,
+): Promise<ApiResponse> => {
+  const payload: Record<string, unknown> = { channel_id: channelId, enabled }
+  if (chatNotifyEnabled !== undefined) {
+    payload.chat_notify_enabled = chatNotifyEnabled
+  }
+  return post(`${MESSAGE_PREFIX}/${cookieId}`, payload)
 }
 
 // 删除消息通知

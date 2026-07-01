@@ -1,4 +1,5 @@
 import { get, post, put, del } from '@/utils/request'
+import request from '@/utils/request'
 import type { ApiResponse } from '@/types'
 
 const CARD_PREFIX = '/api/v1/cards'
@@ -141,4 +142,86 @@ export const updateItemCards = (
 // 批量清空商品的卡券关联关系（不删除卡券本身）
 export const batchClearItemRelations = (itemIds: string[]): Promise<ApiResponse> => {
   return post(`${CARD_PREFIX}/batch-clear-item-relations`, { item_ids: itemIds })
+}
+
+// ==================== 卡密库存（未售/已售）====================
+
+// 单条卡密库存记录
+export interface CardStockItem {
+  id: number | null          // 已售记录有数据库主键；未售为 null
+  card_no: string
+  card_secret: string | null
+  content: string            // 原始整行内容（导出/删除以此为准）
+  status: 'unsold' | 'sold'
+  order_id: string | null
+  account_id: string | null
+  buyer_id: string | null
+  cost_price: string | null
+  channel: string | null
+  sold_at: string | null
+  created_at: string | null
+}
+
+// 卡密库存分页响应
+export interface CardStockResult {
+  list: CardStockItem[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  unsold_total: number
+  sold_total: number
+  card: { id: number; name: string; type: string }
+}
+
+export interface CardStockQuery {
+  tab?: 'unsold' | 'sold'
+  search?: string
+  page?: number
+  page_size?: number
+}
+
+// 获取卡密库存明细（未售/已售 + 模糊搜索 + 分页）
+export const getCardStock = async (
+  cardId: number,
+  params?: CardStockQuery,
+): Promise<CardStockResult> => {
+  const query = new URLSearchParams()
+  query.set('tab', params?.tab || 'unsold')
+  if (params?.search) query.set('search', params.search)
+  query.set('page', String(params?.page || 1))
+  query.set('page_size', String(params?.page_size || 20))
+  const res = await get<ApiResponse<CardStockResult>>(`${CARD_PREFIX}/${cardId}/stock?${query.toString()}`)
+  return res.data as CardStockResult
+}
+
+// 导出卡密为 txt（一行一条「卡号 密码」），触发浏览器下载
+export const exportCardStock = async (
+  cardId: number,
+  tab: 'unsold' | 'sold' = 'unsold',
+  search = '',
+): Promise<void> => {
+  const query = new URLSearchParams()
+  query.set('tab', tab)
+  if (search) query.set('search', search)
+  const response = await request.get(`${CARD_PREFIX}/${cardId}/stock/export?${query.toString()}`, {
+    responseType: 'blob',
+  })
+  const blob = new Blob([response.data], { type: 'text/plain;charset=utf-8' })
+  const url = window.URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `card_${cardId}_${tab}.txt`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  window.URL.revokeObjectURL(url)
+}
+
+// 批量删除卡密：未售按整行内容 contents；已售按记录ID ids
+export const batchDeleteCardStock = (
+  cardId: number,
+  payload: { status: 'unsold' | 'sold'; contents?: string[]; ids?: number[] },
+): Promise<ApiResponse<{ removed: number }>> => {
+  return post(`${CARD_PREFIX}/${cardId}/stock/batch-delete`, payload)
 }

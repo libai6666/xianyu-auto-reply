@@ -1146,14 +1146,13 @@ async def deliver_order(request: DeliverOrderRequest):
         except Exception:
             pass
 
-        # ============ 消费+发送一体化循环 ============
-        # 关键设计：每一轮把"获取内容"和"发送"绑定为原子动作，无论发送成功/失败都把
-        # 原始内容写入 final_contents（失败带[发送失败-请手动转发]标记），保证已扣库存的卡密
-        # 都能通过订单 delivery_content 字段追溯（避免 data/api 类型扣了库存但买家没收到、
-        # 订单也没记录的资损盲区）。
-        # raw_contents     : 每张卡密的"原始内容"（用于对接卡券创建代理订单时的内容字段）
-        # final_contents   : 每张卡密的"最终展示内容"（含失败标记），用于订单 delivery_content
-        # failed_indices   : 发送失败的下标（1-based），用于响应暴露给调用方
+        # ============ 消费循环 + 合并发送 ============
+        # 多数量发货语义：买家买 N 件时，先把 N 份卡密内容全部取出（data/api 会逐张扣库存），
+        # 再合并成"一条消息"发送——说明模板（card.description）只渲染一次，N 份卡密内容按行
+        # 堆叠在一起，避免把整段说明重复 N 遍打扰买家（图片类型无法并入一条文本消息，仍逐张发）。
+        # raw_contents     : 每张卡密的"原始内容"（用于对接卡券创建代理订单、库存追溯）
+        # final_contents   : 写入订单 delivery_content 的最终展示内容（含失败标记）
+        # failed_indices   : 发送失败的卡密下标（1-based），用于响应暴露给调用方
         raw_contents: list[str] = []
         final_contents: list[str] = []
         failed_indices: list[int] = []
@@ -1180,6 +1179,15 @@ async def deliver_order(request: DeliverOrderRequest):
                     )
                     logger.warning(f"【内部API】{early_break_reason}")
                     break
+                else:
+                    # 记录已售卡密到库存明细表（best-effort，失败不影响发货）
+                    try:
+                        db_manager.record_card_sold(
+                            request.card_id, content,
+                            order_id=request.order_no, account_id=account_id, buyer_id=request.buyer_id,
+                        )
+                    except Exception:
+                        pass
             elif card.type == 'image':
                 content = card.image_url
             elif card.type == 'api':
@@ -1216,59 +1224,8 @@ async def deliver_order(request: DeliverOrderRequest):
                 continue
 
             raw_contents.append(content)
-            idx = len(raw_contents)  # 1-based 当前序号
             if quantity > 1:
-                logger.info(f"【内部API】第 {idx}/{quantity} 张卡券内容已获取")
-
-            # ---- 2. 立刻发送本张内容（成功/失败都记录到 final_contents） ----
-            send_ok = False
-            try:
-                if card.type == 'image':
-                    logger.info(
-                        f"【内部API】发送图片消息 第 {idx}/{quantity}: {content}"
-                        if quantity > 1 else f"【内部API】发送图片消息: {content}"
-                    )
-                    await xianyu_live.send_image_msg(
-                        ws,
-                        request.chat_id,
-                        request.buyer_id,
-                        content,
-                        request.card_id
-                    )
-                    final_contents.append(f"[图片]{content}")
-                    send_ok = True
-                else:
-                    rendered = process_delivery_content_with_description(
-                        content,
-                        card.description or '',
-                        _order_context
-                    )
-                    logger.info(
-                        f"【内部API】发送文本消息 第 {idx}/{quantity}: {rendered[:50]}..."
-                        if quantity > 1 else f"【内部API】发送文本消息: {rendered[:50]}..."
-                    )
-                    await xianyu_live.auto_delivery_handler._send_text_with_separator(
-                        ws,
-                        request.chat_id,
-                        request.buyer_id,
-                        rendered
-                    )
-                    final_contents.append(rendered)
-                    send_ok = True
-            except Exception as send_err:
-                # 发送失败时仍把"原始内容"写入 final_contents 但带失败标记，保证库存被消费的卡密
-                # 都能在订单 delivery_content 中追溯，避免数据丢失。商家可从这里手动复制转发。
-                failed_indices.append(idx)
-                logger.error(f"【内部API】第 {idx}/{quantity} 张卡券发送异常: {send_err}")
-                if card.type == 'image':
-                    final_contents.append(f"[图片-发送失败-请手动转发]{content}")
-                else:
-                    # 失败的内容仍按原始 content 记录（不渲染备注，保留原始可复用形态）
-                    final_contents.append(f"[发送失败-请手动转发] {content}")
-
-            # ---- 3. 多张之间间隔 1 秒（即使发送失败也间隔，避免风控） ----
-            if quantity > 1 and i < quantity - 1:
-                await asyncio.sleep(1)
+                logger.info(f"【内部API】第 {len(raw_contents)}/{quantity} 张卡券内容已获取")
 
         # 没有获取到任何内容：双重保险（前面已 return，这里防御性兜底）
         if not raw_contents:
@@ -1279,6 +1236,59 @@ async def deliver_order(request: DeliverOrderRequest):
                 "message": "未获取到任何发货内容",
                 "data": None
             }
+
+        # ============ 合并发送：多数量只发"一条消息"，说明模板只渲染一次 ============
+        # 文本类（text/data/api）：把已取出的 N 份卡密内容按行堆叠成一块，整体套一次
+        # card.description（{DELIVERY_CONTENT} 或无变量时说明拼在内容前），合并为一条消息发送，
+        # 避免整段说明重复 N 遍。图片类型无法并入一条文本消息，仍逐张发送。
+        # 发送成功/失败都写入 final_contents（失败带[发送失败-请手动转发]标记），保证已扣库存卡密可追溯。
+        if card.type == 'image':
+            for idx, content in enumerate(raw_contents, 1):
+                try:
+                    logger.info(
+                        f"【内部API】发送图片消息 第 {idx}/{len(raw_contents)}: {content}"
+                        if len(raw_contents) > 1 else f"【内部API】发送图片消息: {content}"
+                    )
+                    await xianyu_live.send_image_msg(
+                        ws,
+                        request.chat_id,
+                        request.buyer_id,
+                        content,
+                        request.card_id
+                    )
+                    final_contents.append(f"[图片]{content}")
+                except Exception as send_err:
+                    failed_indices.append(idx)
+                    logger.error(f"【内部API】第 {idx}/{len(raw_contents)} 张图片发送异常: {send_err}")
+                    final_contents.append(f"[图片-发送失败-请手动转发]{content}")
+                if idx < len(raw_contents):
+                    await asyncio.sleep(1)
+        else:
+            # 多份卡密按行堆叠为一块，只渲染一次说明模板 → 一条消息（即"账号行堆叠、说明只出现一次"）
+            merged_raw = "\n".join(raw_contents)
+            rendered = process_delivery_content_with_description(
+                merged_raw,
+                card.description or '',
+                _order_context
+            )
+            try:
+                logger.info(
+                    f"【内部API】合并发送 {len(raw_contents)} 张卡券为一条消息: {rendered[:50]}..."
+                    if len(raw_contents) > 1 else f"【内部API】发送文本消息: {rendered[:50]}..."
+                )
+                await xianyu_live.auto_delivery_handler._send_text_with_separator(
+                    ws,
+                    request.chat_id,
+                    request.buyer_id,
+                    rendered
+                )
+                final_contents.append(rendered)
+            except Exception as send_err:
+                # 合并消息发送失败：本单已消费的 N 张卡密全部标记为失败，保留原始内容便于手动补发
+                logger.error(f"【内部API】合并消息发送异常（共 {len(raw_contents)} 张）: {send_err}")
+                for idx in range(1, len(raw_contents) + 1):
+                    failed_indices.append(idx)
+                final_contents.append(f"[发送失败-请手动转发] {merged_raw}")
 
         actual_count = len(raw_contents)
         send_failed_count = len(failed_indices)

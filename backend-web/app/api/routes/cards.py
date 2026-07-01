@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +69,22 @@ class CardUpdate(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     ids: List[int]
+
+
+class StockBatchDeleteRequest(BaseModel):
+    """卡密库存批量删除请求。
+
+    - status='unsold'：按整行内容 contents 从 data_content 移除未售卡密
+    - status='sold'：按 xy_card_stock 主键 ids 删除已售明细记录
+    """
+    status: str = "unsold"
+    contents: Optional[List[str]] = None
+    ids: Optional[List[int]] = None
+
+
+class StockAddRequest(BaseModel):
+    """向「批量数据」类卡券未售库存追加卡密（每行一条「卡号 密码」）。"""
+    content: str = ""
 
 
 class BatchSaveCardRequest(BaseModel):
@@ -283,6 +300,97 @@ async def delete_card(
     if success:
         return {"message": "卡券删除成功"}
     raise HTTPException(status_code=404, detail="卡券不存在")
+
+
+@router.get("/{card_id}/stock")
+async def get_card_stock(
+    card_id: int,
+    tab: str = Query(default="unsold", description="未售 unsold / 已售 sold"),
+    search: str = Query(default="", description="模糊搜索（卡号/密码/订单/账号）"),
+    page: int = Query(default=1, ge=1, description="页码"),
+    page_size: int = Query(default=20, ge=1, le=1000, description="每页数量"),
+    current_user: User = Depends(deps.get_current_active_user),
+    card_service: CardService = Depends(get_card_service),
+):
+    """卡密库存明细（未售/已售 + 模糊搜索 + 分页）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    status = "sold" if tab == "sold" else "unsold"
+    result = await card_service.get_card_stock(
+        card_id=card_id, user_id=user_id, status=status,
+        search=search, page=page, page_size=page_size,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="卡券不存在")
+    return ApiResponse(success=True, data=result)
+
+
+@router.get("/{card_id}/stock/export")
+async def export_card_stock(
+    card_id: int,
+    tab: str = Query(default="unsold", description="未售 unsold / 已售 sold"),
+    search: str = Query(default="", description="模糊搜索"),
+    current_user: User = Depends(deps.get_current_active_user),
+    card_service: CardService = Depends(get_card_service),
+):
+    """导出卡密为 txt（一行一条「卡号 密码」）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    status = "sold" if tab == "sold" else "unsold"
+    content = await card_service.export_card_stock(
+        card_id=card_id, user_id=user_id, status=status, search=search,
+    )
+    if content is None:
+        raise HTTPException(status_code=404, detail="卡券不存在")
+    filename = f"card_{card_id}_{status}.txt"
+    return PlainTextResponse(
+        content,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/{card_id}/stock/add")
+async def add_card_stock(
+    card_id: int,
+    request: StockAddRequest,
+    current_user: User = Depends(deps.get_current_active_user),
+    card_service: CardService = Depends(get_card_service),
+):
+    """向「批量数据」类卡券的未售库存追加卡密（每行一条「卡号 密码」）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    result = await card_service.add_unsold_stock(
+        card_id=card_id, user_id=user_id, content=request.content or "",
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "添加失败")
+    return ApiResponse(
+        success=True,
+        message=result.get("message") or "添加成功",
+        data={"added": result.get("added", 0)},
+    )
+
+
+@router.post("/{card_id}/stock/batch-delete")
+async def batch_delete_card_stock(
+    card_id: int,
+    request: StockBatchDeleteRequest,
+    current_user: User = Depends(deps.get_current_active_user),
+    card_service: CardService = Depends(get_card_service),
+):
+    """批量删除卡密（未售按整行内容、已售按记录ID）"""
+    user_id, _ = resolve_owner_scope(current_user)
+    if request.status == "sold":
+        removed = await card_service.batch_delete_sold_stock(
+            card_id=card_id, user_id=user_id, ids=request.ids or [],
+        )
+    else:
+        removed = await card_service.batch_delete_unsold_stock(
+            card_id=card_id, user_id=user_id, contents=request.contents or [],
+        )
+    return ApiResponse(
+        success=True,
+        message=f"成功删除 {removed} 条卡密",
+        data={"removed": removed},
+    )
 
 
 @router.post("/upload-image")

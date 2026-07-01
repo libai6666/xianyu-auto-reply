@@ -11,7 +11,7 @@
 import { useState, useEffect } from 'react'
 import {
   Ticket, RefreshCw, Trash2, Search, Power, PowerOff, Image,
-  ChevronLeft, ChevronRight, CheckSquare, Square, Edit2, Copy, Eye, Plus, Link
+  ChevronLeft, ChevronRight, CheckSquare, Square, Edit2, Copy, Eye, Plus, Link, Boxes
 } from 'lucide-react'
 import { getCards, updateCard, deleteCard, batchDeleteCards, type CardData, type CardPaginatedResult } from '@/api/cards'
 import { useUIStore } from '@/store/uiStore'
@@ -19,6 +19,7 @@ import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { CardDetailModal } from './CardDetailModal'
+import { CardStockDetail } from './CardStockDetail'
 import { CardFormModal, cardToFormData, cardToCopyFormData, emptyCardFormData } from './CardFormModal'
 import { CardItemRelationModal } from './CardItemRelationModal'
 
@@ -54,6 +55,8 @@ export function Cards() {
   const [previewImageUrl, setPreviewImageUrl] = useState('')
   // 查看明细弹窗
   const [detailCard, setDetailCard] = useState<CardData | null>(null)
+  // 卡密详情（未售/已售）弹窗
+  const [stockCard, setStockCard] = useState<CardData | null>(null)
   // 编辑/复制弹窗
   const [showFormModal, setShowFormModal] = useState(false)
   const [editingCardId, setEditingCardId] = useState<number | null>(null)
@@ -469,6 +472,15 @@ export function Cards() {
                           >
                             <Eye className="w-4 h-4 text-blue-500" />
                           </button>
+                          {card.type === 'data' && (
+                            <button
+                              onClick={() => setStockCard(card)}
+                              className="table-action-btn hover:!bg-amber-50"
+                              title="卡密详情（未售/已售）"
+                            >
+                              <Boxes className="w-4 h-4 text-amber-500" />
+                            </button>
+                          )}
                           <button
                             onClick={() => openEditModal(card)}
                             className="table-action-btn hover:!bg-blue-50"
@@ -572,6 +584,15 @@ export function Cards() {
       {/* 查看明细弹窗 */}
       {detailCard && (
         <CardDetailModal card={detailCard} onClose={() => setDetailCard(null)} />
+      )}
+
+      {/* 卡密详情（未售/已售）弹窗 */}
+      {stockCard && (
+        <CardStockDetail
+          card={stockCard}
+          onClose={() => setStockCard(null)}
+          onChanged={() => loadCards()}
+        />
       )}
 
       {/* 编辑/复制弹窗 */}

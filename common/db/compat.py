@@ -24,6 +24,7 @@ from common.models.xy_catalog_item import XYCatalogItem
 from common.models.xy_order import XYOrder
 from common.models.xy_keyword_rule import XYKeywordRule
 from common.models.card import Card
+from common.models.card_stock import CardStock
 from common.models.default_reply import DefaultReply
 from common.models.confirm_receipt_message import ConfirmReceiptMessage
 from common.models.user_setting import UserSetting
@@ -1063,6 +1064,34 @@ class DBManagerCompat:
             logger.error(f"获取账号通知配置失败: {e}")
             return []
     
+    def is_chat_notify_enabled(self, cookie_id: str) -> bool:
+        """聊天消息通知开关（方案A）。
+
+        读取 xy_message_notifications.chat_notify_enabled：
+        - 该账号任一订阅行为真 → 允许发聊天通知；
+        - 全部为假 → 关闭聊天通知（只保留订单/发货通知）；
+        - 列不存在/查询异常 → 兼容旧库，按开启处理（fail-open，不影响发货通知）。
+        """
+        async def _query(session_maker):
+            async with session_maker() as session:
+                res = await session.execute(
+                    text(
+                        "SELECT COALESCE(MAX(chat_notify_enabled), 1) "
+                        "FROM xy_message_notifications "
+                        "WHERE account_identifier = :cid"
+                    ),
+                    {"cid": cookie_id},
+                )
+                val = res.scalar()
+                return True if val is None else bool(val)
+
+        try:
+            result = self._run_async(_query)
+            return True if result is None else bool(result)
+        except Exception as e:
+            logger.warning(f"读取聊天通知开关失败，默认按开启: {e}")
+            return True
+
     def get_notification_channels(self, user_id: int = None) -> List[Dict[str, Any]]:
         """获取所有通知渠道
         
@@ -1593,6 +1622,58 @@ class DBManagerCompat:
         except Exception as e:
             logger.error(f"消费批量数据失败: {e}")
             return None
+
+    def record_card_sold(
+        self,
+        card_id: int,
+        content: str,
+        order_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        buyer_id: Optional[str] = None,
+    ) -> bool:
+        """记录一条已售卡密到库存明细表 xy_card_stock。
+
+        best-effort：任何异常都只记日志、不抛出，保证不影响发货主流程。
+        卡密格式按「卡号 密码」首个空白拆分；无密码时整行作为卡号、密码留空。
+        """
+        if not content or not str(content).strip():
+            return False
+        try:
+            line = str(content).strip()
+            parts = line.split(None, 1)
+            card_no = parts[0] if parts else line
+            card_secret = parts[1].strip() if len(parts) > 1 else None
+            sold_time = get_beijing_now_naive()
+
+            async def _record(session_maker):
+                async with session_maker() as session:
+                    user_id = None
+                    try:
+                        uid_res = await session.execute(
+                            select(Card.user_id).where(Card.id == card_id)
+                        )
+                        user_id = uid_res.scalar_one_or_none()
+                    except Exception:
+                        user_id = None
+                    session.add(CardStock(
+                        card_id=card_id,
+                        user_id=user_id,
+                        card_no=(card_no[:255] if card_no else None),
+                        card_secret=(card_secret[:255] if card_secret else None),
+                        content=line[:1024],
+                        status='sold',
+                        order_id=order_id,
+                        account_id=account_id,
+                        buyer_id=buyer_id,
+                        sold_at=sold_time,
+                    ))
+                    await session.commit()
+                    return True
+
+            return bool(self._run_async(_record))
+        except Exception as e:
+            logger.error(f"记录已售卡密失败(card_id={card_id}): {e}")
+            return False
 
     def increment_delivery_count(self, card_id: int) -> bool:
         """增加卡券的发货次数

@@ -366,6 +366,270 @@ class CardService:
         logger.error(f"卡券 {card_id} 消费失败：并发竞争超过最大重试次数 {max_cas_retries}")
         return None
 
+    # ==================== 卡密库存（未售/已售）管理 ====================
+
+    @staticmethod
+    def _parse_card_line(line: str) -> Dict[str, Optional[str]]:
+        """将一行卡密按首个空白拆成 卡号/密码。无密码时整行作卡号、密码留空。"""
+        line = (line or "").strip()
+        parts = line.split(None, 1)
+        card_no = parts[0] if parts else line
+        card_secret = parts[1].strip() if len(parts) > 1 else None
+        return {"card_no": card_no, "card_secret": card_secret, "content": line}
+
+    def _unsold_lines(self, data_content: Optional[str]) -> List[str]:
+        if not data_content:
+            return []
+        return [ln.strip() for ln in data_content.split("\n") if ln.strip()]
+
+    async def _get_card_for_stock(self, card_id: int, user_id: int | None) -> Optional[Card]:
+        stmt = select(Card).where(Card.id == card_id)
+        if user_id is not None:
+            stmt = stmt.where(Card.user_id == user_id)
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def get_card_stock(
+        self,
+        card_id: int,
+        user_id: int | None,
+        status: str = "unsold",
+        search: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """卡密库存明细（未售来自 data_content，已售来自 xy_card_stock）。
+
+        返回 None 表示卡券不存在或无权限。
+        """
+        from common.models.card_stock import CardStock
+
+        card = await self._get_card_for_stock(card_id, user_id)
+        if card is None:
+            return None
+
+        kw = (search or "").strip()
+        unsold_lines = self._unsold_lines(card.data_content)
+        unsold_total_all = len(unsold_lines)
+        sold_total_all = (await self.session.execute(
+            select(func.count()).select_from(CardStock).where(
+                CardStock.card_id == card_id, CardStock.status == "sold"
+            )
+        )).scalar() or 0
+
+        items: List[Dict[str, Any]] = []
+        if status == "sold":
+            conditions = [CardStock.card_id == card_id, CardStock.status == "sold"]
+            if kw:
+                like = f"%{kw}%"
+                conditions.append(or_(
+                    CardStock.card_no.like(like),
+                    CardStock.card_secret.like(like),
+                    CardStock.content.like(like),
+                    CardStock.order_id.like(like),
+                    CardStock.account_id.like(like),
+                ))
+            total = (await self.session.execute(
+                select(func.count()).select_from(CardStock).where(*conditions)
+            )).scalar() or 0
+            rows = (await self.session.execute(
+                select(CardStock).where(*conditions)
+                .order_by(CardStock.sold_at.desc(), CardStock.id.desc())
+                .offset((page - 1) * page_size).limit(page_size)
+            )).scalars().all()
+            for r in rows:
+                items.append({
+                    "id": r.id,
+                    "card_no": r.card_no,
+                    "card_secret": r.card_secret,
+                    "content": r.content,
+                    "status": r.status,
+                    "order_id": r.order_id,
+                    "account_id": r.account_id,
+                    "buyer_id": r.buyer_id,
+                    "cost_price": r.cost_price,
+                    "channel": r.channel,
+                    "sold_at": safe_isoformat(r.sold_at),
+                    "created_at": safe_isoformat(r.created_at),
+                })
+        else:
+            parsed = [self._parse_card_line(ln) for ln in unsold_lines]
+            if kw:
+                low = kw.lower()
+                parsed = [p for p in parsed if low in (p["content"] or "").lower()]
+            total = len(parsed)
+            start = (page - 1) * page_size
+            for p in parsed[start:start + page_size]:
+                items.append({
+                    "id": None,
+                    "card_no": p["card_no"],
+                    "card_secret": p["card_secret"],
+                    "content": p["content"],
+                    "status": "unsold",
+                    "order_id": None,
+                    "account_id": None,
+                    "buyer_id": None,
+                    "cost_price": card.price,
+                    "channel": None,
+                    "sold_at": None,
+                    "created_at": None,
+                })
+
+        total_pages = (total + page_size - 1) // page_size if page_size else 1
+        return {
+            "list": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "unsold_total": unsold_total_all,
+            "sold_total": sold_total_all,
+            "card": {"id": card.id, "name": card.name, "type": card.type},
+        }
+
+    async def export_card_stock(
+        self,
+        card_id: int,
+        user_id: int | None,
+        status: str = "unsold",
+        search: str = "",
+    ) -> Optional[str]:
+        """导出卡密为纯文本（一行一条「卡号 密码」）。返回 None 表示卡券不存在。"""
+        from common.models.card_stock import CardStock
+
+        card = await self._get_card_for_stock(card_id, user_id)
+        if card is None:
+            return None
+        kw = (search or "").strip().lower()
+        lines: List[str] = []
+        if status == "sold":
+            rows = (await self.session.execute(
+                select(CardStock).where(
+                    CardStock.card_id == card_id, CardStock.status == "sold"
+                ).order_by(CardStock.sold_at.desc(), CardStock.id.desc())
+            )).scalars().all()
+            for r in rows:
+                content = r.content or (
+                    f"{r.card_no} {r.card_secret}".strip() if r.card_secret else (r.card_no or "")
+                )
+                if kw and kw not in content.lower():
+                    continue
+                lines.append(content)
+        else:
+            for ln in self._unsold_lines(card.data_content):
+                if kw and kw not in ln.lower():
+                    continue
+                lines.append(ln)
+        return "\n".join(lines)
+
+    async def batch_delete_unsold_stock(
+        self,
+        card_id: int,
+        user_id: int | None,
+        contents: List[str],
+    ) -> int:
+        """批量删除未售卡密（从 data_content 中移除指定整行内容，CAS 并发安全）。"""
+        from collections import Counter
+
+        card = await self._get_card_for_stock(card_id, user_id)
+        if card is None:
+            return 0
+        targets = Counter(c.strip() for c in (contents or []) if c and c.strip())
+        if not targets:
+            return 0
+
+        max_cas_retries = 50
+        for _ in range(max_cas_retries):
+            current = (await self.session.execute(
+                select(Card.data_content).where(Card.id == card_id)
+            )).scalar_one_or_none()
+            if not current:
+                return 0
+            lines = [ln.strip() for ln in current.split("\n") if ln.strip()]
+            remaining: List[str] = []
+            quota = Counter(targets)
+            removed = 0
+            for ln in lines:
+                if quota.get(ln, 0) > 0:
+                    quota[ln] -= 1
+                    removed += 1
+                else:
+                    remaining.append(ln)
+            if removed == 0:
+                return 0
+            new_content = "\n".join(remaining)
+            cas = await self.session.execute(
+                update(Card)
+                .where(Card.id == card_id, Card.data_content == current)
+                .values(data_content=new_content)
+            )
+            await self.session.commit()
+            if cas.rowcount == 1:
+                return removed
+        return 0
+
+    async def add_unsold_stock(
+        self,
+        card_id: int,
+        user_id: int | None,
+        content: str,
+    ) -> Dict[str, Any]:
+        """向「批量数据(data)」类卡券的未售库存追加卡密（每行一条），CAS 并发安全。
+
+        返回 {"ok": bool, "added": int, "message": str}。
+        """
+        card = await self._get_card_for_stock(card_id, user_id)
+        if card is None:
+            return {"ok": False, "added": 0, "message": "卡券不存在"}
+        if card.type != "data":
+            return {"ok": False, "added": 0, "message": "仅「批量数据」类型卡券支持添加库存"}
+        new_lines = [ln.strip() for ln in (content or "").split("\n") if ln.strip()]
+        if not new_lines:
+            return {"ok": False, "added": 0, "message": "没有可添加的卡密"}
+
+        max_cas_retries = 50
+        for _ in range(max_cas_retries):
+            current = (await self.session.execute(
+                select(Card.data_content).where(Card.id == card_id)
+            )).scalar_one_or_none()
+            existing = [ln.strip() for ln in (current or "").split("\n") if ln.strip()]
+            new_content = "\n".join(existing + new_lines)
+            where_clause = [Card.id == card_id]
+            if current is None:
+                where_clause.append(Card.data_content.is_(None))
+            else:
+                where_clause.append(Card.data_content == current)
+            cas = await self.session.execute(
+                update(Card).where(*where_clause).values(data_content=new_content)
+            )
+            await self.session.commit()
+            if cas.rowcount == 1:
+                return {"ok": True, "added": len(new_lines), "message": f"已添加 {len(new_lines)} 条卡密"}
+        return {"ok": False, "added": 0, "message": "并发冲突，请重试"}
+
+    async def batch_delete_sold_stock(
+        self,
+        card_id: int,
+        user_id: int | None,
+        ids: List[int],
+    ) -> int:
+        """批量删除已售卡密明细记录（按 xy_card_stock 主键）。"""
+        from common.models.card_stock import CardStock
+
+        card = await self._get_card_for_stock(card_id, user_id)
+        if card is None:
+            return 0
+        ids = [i for i in (ids or []) if i is not None]
+        if not ids:
+            return 0
+        result = await self.session.execute(
+            delete(CardStock).where(
+                CardStock.card_id == card_id, CardStock.id.in_(ids)
+            )
+        )
+        await self.session.commit()
+        return result.rowcount or 0
+
     async def increment_delivery_count(self, card_id: int) -> bool:
         """增加卡券的发货次数
         

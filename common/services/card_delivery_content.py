@@ -225,6 +225,28 @@ async def build_delivery_content(
         if text_content is None:
             logger.warning(f"卡券 {card.id} 批量数据已用完，提货失败")
             return None
+        # 记录已售卡密到库存明细表（同事务，best-effort）
+        try:
+            from common.models.card_stock import CardStock
+            from common.utils.time_utils import get_beijing_now_naive
+            _line = str(text_content).strip()
+            _parts = _line.split(None, 1)
+            _card_no = _parts[0] if _parts else _line
+            _card_secret = _parts[1].strip() if len(_parts) > 1 else None
+            session.add(CardStock(
+                card_id=card.id,
+                user_id=card.user_id,
+                card_no=(_card_no[:255] if _card_no else None),
+                card_secret=(_card_secret[:255] if _card_secret else None),
+                content=_line[:1024],
+                status='sold',
+                order_id=context.get('order_id'),
+                account_id=None,
+                buyer_id=context.get('buyer_id'),
+                sold_at=get_beijing_now_naive(),
+            ))
+        except Exception as _e:
+            logger.warning(f"卡券 {card.id} 记录已售卡密失败（提货）: {_e}")
     elif card_type == 'api':
         text_content = await get_api_card_content(card.api_config, context)
         if text_content is None:
