@@ -218,6 +218,14 @@ export const exportCardStock = async (
   window.URL.revokeObjectURL(url)
 }
 
+// 批量添加卡密（仅批量数据类卡券，追加进未售库存，一行一条）
+export const addCardStock = (
+  cardId: number,
+  content: string,
+): Promise<ApiResponse<{ added: number }>> => {
+  return post(`${CARD_PREFIX}/${cardId}/stock/add`, { content })
+}
+
 // 批量删除卡密：未售按整行内容 contents；已售按记录ID ids
 export const batchDeleteCardStock = (
   cardId: number,

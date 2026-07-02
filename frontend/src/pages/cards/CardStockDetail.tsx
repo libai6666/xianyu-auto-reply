@@ -7,11 +7,13 @@
  * 3. 分页展示
  * 4. 导出 txt（一行一条「卡号 密码」）
  * 5. 批量删除（未售按整行内容，已售按记录ID）
+ * 6. 批量添加（仅批量数据卡券，追加进未售库存）
  */
 import { useCallback, useEffect, useState } from 'react'
-import { X, Search, Download, Trash2, CheckSquare, Square, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react'
+import { X, Search, Download, Trash2, CheckSquare, Square, ChevronLeft, ChevronRight, RefreshCw, Plus } from 'lucide-react'
 import {
   getCardStock,
+  addCardStock,
   batchDeleteCardStock,
   type CardData,
   type CardStockItem,
@@ -51,6 +53,12 @@ export function CardStockDetail({ card, onClose, onChanged, zIndex = 60 }: CardS
   const [deleting, setDeleting] = useState(false)
   const [showExportConfirm, setShowExportConfirm] = useState(false)
   const [deleteAfterExport, setDeleteAfterExport] = useState(true)
+  const [showAdd, setShowAdd] = useState(false)
+  const [addContent, setAddContent] = useState('')
+  const [adding, setAdding] = useState(false)
+
+  // 仅「批量数据」类卡券支持批量添加
+  const canAdd = card.type === 'data'
 
   // 选中项的 key：未售用 content（整行内容），已售用 id
   const keyOf = (item: CardStockItem): string =>
@@ -170,6 +178,29 @@ export function CardStockDetail({ card, onClose, onChanged, zIndex = 60 }: CardS
     }
   }
 
+  const handleAdd = async () => {
+    const lines = addContent.split('\n').map(s => s.trim()).filter(Boolean)
+    if (lines.length === 0) {
+      addToast({ type: 'warning', message: '请输入要添加的卡密' })
+      return
+    }
+    setAdding(true)
+    try {
+      const res = await addCardStock(cardId, lines.join('\n'))
+      addToast({ type: 'success', message: `成功添加 ${res.data?.added ?? lines.length} 条卡密` })
+      setShowAdd(false)
+      setAddContent('')
+      if (tab !== 'unsold') switchTab('unsold')
+      else if (page > 1) setPage(1)
+      else load()
+      onChanged?.()
+    } catch {
+      addToast({ type: 'error', message: '批量添加失败' })
+    } finally {
+      setAdding(false)
+    }
+  }
+
   const handleBatchDelete = async () => {
     setDeleting(true)
     try {
@@ -232,7 +263,7 @@ export function CardStockDetail({ card, onClose, onChanged, zIndex = 60 }: CardS
             </button>
           </div>
 
-          {/* 工具栏：搜索 / 导出 / 批量删除 */}
+          {/* 工具栏：搜索 / 批量添加 / 导出 / 批量删除 */}
           <div className="flex flex-wrap items-center gap-2">
             <div className="relative flex-1 min-w-[200px]">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -247,6 +278,14 @@ export function CardStockDetail({ card, onClose, onChanged, zIndex = 60 }: CardS
             <button onClick={doSearch} className="btn-ios-secondary inline-flex items-center gap-1">
               <Search className="w-4 h-4" /> 搜索
             </button>
+            {canAdd && (
+              <button
+                onClick={() => setShowAdd(true)}
+                className="px-3 py-2 text-sm font-medium rounded-lg bg-blue-500 text-white hover:bg-blue-600 inline-flex items-center gap-1"
+              >
+                <Plus className="w-4 h-4" /> 批量添加
+              </button>
+            )}
             <button
               onClick={handleExport}
               disabled={exporting || selected.size === 0}
@@ -366,6 +405,47 @@ export function CardStockDetail({ card, onClose, onChanged, zIndex = 60 }: CardS
         onConfirm={handleBatchDelete}
         onCancel={() => setConfirmDelete(false)}
       />
+
+      {showAdd && (
+        <div className="modal-overlay" style={{ zIndex: zIndex + 1 }}>
+          <div className="modal-content max-w-lg">
+            <div className="modal-header flex items-center justify-between">
+              <h2 className="text-lg font-semibold">批量添加卡密</h2>
+              <button
+                onClick={() => { if (!adding) setShowAdd(false) }}
+                className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg"
+              >
+                <X className="w-4 h-4 text-gray-500" />
+              </button>
+            </div>
+            <div className="modal-body flex flex-col gap-3">
+              <p className="text-sm text-gray-600 dark:text-gray-300">
+                一行一条，格式与卡券数据一致（如「卡号 密码」或单个兑换码），将追加进未售库存。
+              </p>
+              <textarea
+                value={addContent}
+                onChange={e => setAddContent(e.target.value)}
+                rows={8}
+                placeholder={'卡号1 密码1\n卡号2 密码2\n或\n兑换码1\n兑换码2'}
+                className="w-full px-3 py-2 text-sm font-mono border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <p className="text-xs text-gray-400">
+                共 {addContent.split('\n').filter(s => s.trim()).length} 条
+              </p>
+            </div>
+            <div className="modal-footer flex justify-end gap-2">
+              <button onClick={() => setShowAdd(false)} disabled={adding} className="btn-ios-secondary">取消</button>
+              <button
+                onClick={handleAdd}
+                disabled={adding}
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 inline-flex items-center gap-1"
+              >
+                {adding ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} 确认添加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showExportConfirm && (
         <div className="modal-overlay" style={{ zIndex: zIndex + 1 }}>
